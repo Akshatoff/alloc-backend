@@ -1,5 +1,5 @@
 """
-Alloc8 v5.0: Multimodal Backend (Road, Air, Sea) - FIXED
+Alloc8 v5.0: Fixed - Overflow and Worker Timeout Issues
 """
 
 import json
@@ -16,9 +16,13 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 CORS(app)
 
+# INT64 max value for OR-Tools
+MAX_INT64 = 9223372036854775807
+TIME_SCALE_FACTOR = 1000  # Scale down times to prevent overflow
+
 CONSTANTS = {
     "osrm_base_url": "http://router.project-osrm.org",
-    "loading_time_per_kg": 2.0,
+    "loading_time_per_kg": 0.002,  # Scaled down from 2.0
     "fixed_stop_time": 900,
     "max_driver_dist_km": 5000,
     "max_shift_time_sec": 86400,
@@ -47,7 +51,7 @@ def get_haversine_distance(coord1, coord2):
 
 
 def get_multimodal_matrix(coords):
-    """Builds distance/time/mode matrix"""
+    """Builds distance/time/mode matrix with overflow protection"""
     n = len(coords)
     formatted_coords = ";".join([f"{c[1]},{c[0]}" for c in coords])
     url = f"{CONSTANTS['osrm_base_url']}/table/v1/driving/{formatted_coords}"
@@ -74,11 +78,16 @@ def get_multimodal_matrix(coords):
 
                 geo_dist = get_haversine_distance(coords[i], coords[j])
 
+                # Air travel for long distances
                 if geo_dist > (CONSTANTS["air_threshold_km"] * 1000):
                     dist_matrix[i][j] = geo_dist
-                    time_matrix[i][j] = int(
+                    # Scale down time and cap it
+                    raw_time = int(
                         (geo_dist / CONSTANTS["speed_mps_air"])
                         + CONSTANTS["air_docking_time"]
+                    )
+                    time_matrix[i][j] = min(
+                        raw_time // TIME_SCALE_FACTOR, MAX_INT64 // 10
                     )
                     mode_matrix[i][j] = "air"
                     continue
@@ -86,19 +95,22 @@ def get_multimodal_matrix(coords):
                 osrm_dist = raw_dists[i][j]
                 osrm_time = raw_times[i][j]
 
-                if osrm_dist is None:
+                if osrm_dist is None or osrm_dist > (geo_dist * 3.0):
+                    # Use boat
                     dist_matrix[i][j] = geo_dist
-                    time_matrix[i][j] = int(geo_dist / CONSTANTS["speed_mps_boat"])
+                    raw_time = int(geo_dist / CONSTANTS["speed_mps_boat"])
+                    time_matrix[i][j] = min(
+                        raw_time // TIME_SCALE_FACTOR, MAX_INT64 // 10
+                    )
                     mode_matrix[i][j] = "boat"
                 else:
-                    if osrm_dist > (geo_dist * 3.0):
-                        dist_matrix[i][j] = geo_dist
-                        time_matrix[i][j] = int(geo_dist / CONSTANTS["speed_mps_boat"])
-                        mode_matrix[i][j] = "boat"
-                    else:
-                        dist_matrix[i][j] = int(osrm_dist)
-                        time_matrix[i][j] = int(osrm_time)
-                        mode_matrix[i][j] = "road"
+                    # Use road
+                    dist_matrix[i][j] = int(osrm_dist)
+                    # Scale down time
+                    time_matrix[i][j] = min(
+                        int(osrm_time) // TIME_SCALE_FACTOR, MAX_INT64 // 10
+                    )
+                    mode_matrix[i][j] = "road"
 
     except Exception as e:
         logging.warning(f"OSRM Error ({e}). Using fallback.")
@@ -110,13 +122,19 @@ def get_multimodal_matrix(coords):
                 dist_matrix[i][j] = int(d_m)
 
                 if d_m > (CONSTANTS["air_threshold_km"] * 1000):
-                    time_matrix[i][j] = int(
+                    raw_time = int(
                         (d_m / CONSTANTS["speed_mps_air"])
                         + CONSTANTS["air_docking_time"]
                     )
+                    time_matrix[i][j] = min(
+                        raw_time // TIME_SCALE_FACTOR, MAX_INT64 // 10
+                    )
                     mode_matrix[i][j] = "air"
                 else:
-                    time_matrix[i][j] = int(d_m / CONSTANTS["speed_mps_road"])
+                    raw_time = int(d_m / CONSTANTS["speed_mps_road"])
+                    time_matrix[i][j] = min(
+                        raw_time // TIME_SCALE_FACTOR, MAX_INT64 // 10
+                    )
                     mode_matrix[i][j] = "road"
 
     return dist_matrix, time_matrix, mode_matrix
@@ -176,6 +194,11 @@ def generate_plan():
         if not locations:
             return jsonify({"error": "No locations provided"}), 400
 
+        # Limit locations to prevent timeout (max 20 for free tier)
+        if len(locations) > 20:
+            logging.warning(f"Too many locations ({len(locations)}), limiting to 20")
+            locations = locations[:20]
+
         depot_data = data.get("depot", {})
         if depot_data and "lat" in depot_data:
             depot = depot_data
@@ -206,7 +229,6 @@ def generate_plan():
             raw_demands.append(total_req)
             priorities.append(p_score)
 
-        # Dynamic fleet sizing
         vehicle_capacity = int(
             data.get("vehicle_capacity", CONSTANTS["vehicle_capacity"])
         )
@@ -217,34 +239,26 @@ def generate_plan():
         else:
             estimated_trucks_needed = 1
 
-        max_fleet_limit = 200
+        max_fleet_limit = 50  # Reduced for free tier
         requested_max = data.get("max_fleet_size")
 
         if requested_max:
-            max_fleet_size = int(requested_max)
+            max_fleet_size = min(int(requested_max), max_fleet_limit)
         else:
-            max_fleet_size = min(estimated_trucks_needed + 5, max_fleet_limit)
+            max_fleet_size = min(estimated_trucks_needed + 3, max_fleet_limit)
 
-        num_vehicles = min(max(estimated_trucks_needed, 3), max_fleet_size)
+        num_vehicles = min(max(estimated_trucks_needed, 2), max_fleet_size)
 
-        logging.info(
-            f"Total demand: {total_demand}, Vehicle capacity: {vehicle_capacity}"
-        )
-        logging.info(
-            f"Estimated trucks: {estimated_trucks_needed}, Using: {num_vehicles}"
-        )
+        logging.info(f"Total demand: {total_demand}, Vehicles: {num_vehicles}")
 
         # Allocation
         fleet_cap_total = num_vehicles * vehicle_capacity
         allocated_amounts = solve_allocation_lp(
             raw_demands, fleet_cap_total, priorities
         )
-
-        # FIX: Prepend depot demand (0)
         demands = [0] + allocated_amounts
 
-        logging.info(f"Allocated amounts: {allocated_amounts}")
-        logging.info(f"Demands array (with depot): {demands}")
+        logging.info(f"Allocated: {allocated_amounts[:5]}... (showing first 5)")
 
         # Build matrices
         coords = [[depot["lat"], depot["lon"]]] + [
@@ -254,52 +268,76 @@ def generate_plan():
 
         dist_matrix, time_matrix, mode_matrix = get_multimodal_matrix(coords)
 
-        # Service times
+        # Service times (scaled down)
         service_times = [0] * n
         for i in range(1, n):
-            service_times[i] = int(
-                CONSTANTS["fixed_stop_time"]
-                + (allocated_amounts[i - 1] * CONSTANTS["loading_time_per_kg"])
+            service_times[i] = min(
+                int(
+                    CONSTANTS["fixed_stop_time"] // TIME_SCALE_FACTOR
+                    + (allocated_amounts[i - 1] * CONSTANTS["loading_time_per_kg"])
+                ),
+                MAX_INT64 // 100,
             )
 
+        # Final time matrix with overflow protection
         final_time_matrix = [[0] * n for _ in range(n)]
         for i in range(n):
             for j in range(n):
                 if i == j:
                     continue
-                final_time_matrix[i][j] = int(time_matrix[i][j] + service_times[j])
+                # Cap values to prevent overflow
+                final_time_matrix[i][j] = min(
+                    int(time_matrix[i][j] + service_times[j]), MAX_INT64 // 100
+                )
+
+        # Verify no overflow values
+        max_time = max(max(row) for row in final_time_matrix)
+        logging.info(f"Max time value: {max_time} (safe limit: {MAX_INT64 // 100})")
 
         # OR-Tools setup
         manager = pywrapcp.RoutingIndexManager(n, num_vehicles, 0)
         routing = pywrapcp.RoutingModel(manager)
 
         def time_cb(from_idx, to_idx):
-            return final_time_matrix[manager.IndexToNode(from_idx)][
-                manager.IndexToNode(to_idx)
-            ]
+            try:
+                from_node = manager.IndexToNode(from_idx)
+                to_node = manager.IndexToNode(to_idx)
+                return final_time_matrix[from_node][to_node]
+            except Exception as e:
+                logging.error(f"Time callback error: {e}, from={from_idx}, to={to_idx}")
+                return 1000  # Safe fallback
 
         transit_idx = routing.RegisterTransitCallback(time_cb)
         routing.SetArcCostEvaluatorOfAllVehicles(transit_idx)
 
+        # Reduced limits for free tier
         routing.AddDimension(
             transit_idx,
-            3600 * 4,
-            CONSTANTS["max_shift_time_sec"] * 3,
+            3600,  # Reduced slack
+            CONSTANTS["max_shift_time_sec"] // TIME_SCALE_FACTOR,
             True,
             "Time",
         )
 
         def dist_cb(from_idx, to_idx):
-            return dist_matrix[manager.IndexToNode(from_idx)][
-                manager.IndexToNode(to_idx)
-            ]
+            try:
+                from_node = manager.IndexToNode(from_idx)
+                to_node = manager.IndexToNode(to_idx)
+                return dist_matrix[from_node][to_node]
+            except Exception as e:
+                logging.error(f"Distance callback error: {e}")
+                return 1000
 
         dist_idx = routing.RegisterTransitCallback(dist_cb)
-        routing.AddDimension(dist_idx, 0, 50000000, True, "Distance")
+        routing.AddDimension(dist_idx, 0, 10000000, True, "Distance")
 
         def demand_cb(from_idx):
-            node = manager.IndexToNode(from_idx)
-            return demands[node]
+            try:
+                node = manager.IndexToNode(from_idx)
+                return demands[node]
+            except Exception as e:
+                logging.error(f"Demand callback error: {e}")
+                return 0
 
         demand_idx = routing.RegisterUnaryTransitCallback(demand_cb)
         routing.AddDimensionWithVehicleCapacity(
@@ -313,17 +351,23 @@ def generate_plan():
         search_params.local_search_metaheuristic = (
             routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
         )
-        search_params.time_limit.seconds = int(data.get("time_limit_seconds", 15))
+        # Reduced time limit for free tier
+        search_params.time_limit.seconds = min(
+            int(data.get("time_limit_seconds", 10)), 20
+        )
 
-        # FIX: Lower penalty to encourage visiting all nodes
         penalty = 100000
         for i in range(1, n):
             routing.AddDisjunction([manager.NodeToIndex(i)], penalty)
 
+        logging.info("Starting OR-Tools solver...")
         solution = routing.SolveWithParameters(search_params)
 
         if not solution:
+            logging.error("OR-Tools failed to find solution")
             return jsonify({"error": "Unable to calculate a valid plan."}), 500
+
+        logging.info("Solution found, building routes...")
 
         # Format output
         routes = []
@@ -378,7 +422,9 @@ def generate_plan():
                 mode_counts = {"road": 0, "boat": 0, "air": 0}
                 for seg in route_segments:
                     mode_counts[seg["mode"]] += 1
-                primary_mode = max(mode_counts, key=mode_counts.get)
+                primary_mode = (
+                    max(mode_counts, key=mode_counts.get) if mode_counts else "road"
+                )
 
                 routes.append(
                     {
@@ -393,7 +439,8 @@ def generate_plan():
                 total_distance += route_dist
                 total_resources += route_load
 
-        # FIX: Add missing fields to summary
+        logging.info(f"Generated {len(routes)} routes successfully")
+
         return jsonify(
             {
                 "status": "success",
@@ -403,11 +450,11 @@ def generate_plan():
                 "summary": {
                     "title": f"{strategy.capitalize()} Multimodal Plan",
                     "description": f"Optimized using {len(routes)} vehicles (Road/Sea/Air).",
-                    "strategy": strategy.capitalize(),  # FIX: Add strategy
+                    "strategy": strategy.capitalize(),
                     "totalDistanceMeters": total_distance,
                     "totalResources": sum(raw_demands),
                     "assignedResources": total_resources,
-                    "totalTrucks": len(routes),  # FIX: Add totalTrucks
+                    "totalTrucks": len(routes),
                 },
             }
         )
@@ -418,6 +465,7 @@ def generate_plan():
 
 
 if __name__ == "__main__":
-  import os
-  port = int(os.environ.get('PORT', 5000))
-  app.run(host='0.0.0.0', port=port, debug=False)
+    import os
+
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
