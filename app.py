@@ -1,11 +1,11 @@
 """
-Alloc8 v5.0: Multimodal Backend (Road, Air, Sea) - FIXED CORS
+Alloc8 v5.0: Multimodal Backend (Road, Air, Sea) - FIXED CORS & PORT
 """
 
 import json
 import logging
 import math
-import os
+import os  # <--- Required for Railway PORT
 
 import requests
 from flask import Flask, jsonify, request
@@ -16,17 +16,22 @@ from scipy.optimize import linprog
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
-# --- CORS FIX STARTS HERE ---
-# We rely SOLELY on Flask-CORS.
-# We removed the manual 'after_request' and manual 'OPTIONS' handling.
+# --- CORS FIX ---
+# We added 127.0.0.1:8080 and localhost:8080 to the allowed list.
 CORS(
     app,
     resources={
-        r"/*": {"origins": ["https://alloc8-rho.vercel.app", "http://localhost:3000"]}
+        r"/*": {
+            "origins": [
+                "https://alloc8-rho.vercel.app",
+                "http://localhost:3000",
+                "http://127.0.0.1:8080",
+                "http://localhost:8080",
+            ]
+        }
     },
     supports_credentials=True,
 )
-# --- CORS FIX ENDS HERE ---
 
 CONSTANTS = {
     "osrm_base_url": "http://router.project-osrm.org",
@@ -176,11 +181,9 @@ def solve_allocation_lp(demands, fleet_cap, priorities):
     return [int(x) for x in res.x] if res.success else demands
 
 
-# FIX: Removed "OPTIONS" from methods. Flask-CORS handles that automatically.
 @app.route("/generate-plan", methods=["POST"])
 def generate_plan():
     try:
-        # FIX: Removed force=True. Browser sends correct headers now.
         data = request.get_json()
 
         if not data:
@@ -434,7 +437,7 @@ def generate_plan():
 
 
 if __name__ == "__main__":
-    port = int(
-        os.environ.get("PORT", 5000)
-    )  # host="0.0.0.0" is CRITICAL for containers (Docker/Railway)
+    # --- PORT FIX ---
+    # We must listen on 0.0.0.0 and the Railway-assigned PORT
+    port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
