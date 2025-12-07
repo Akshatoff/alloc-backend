@@ -14,7 +14,21 @@ from scipy.optimize import linprog
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
-CORS(app)
+CORS(
+    app,
+    resources={r"/*": {"origins": "https://alloc8-rho.vercel.app"}},
+    methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type"],
+    supports_credentials=True,
+)
+
+@app.after_request
+def add_cors_headers(response):
+    response.headers["Access-Control-Allow-Origin"] = "https://alloc8-rho.vercel.app"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    return response
+
 
 CONSTANTS = {
     "osrm_base_url": "http://router.project-osrm.org",
@@ -164,8 +178,11 @@ def solve_allocation_lp(demands, fleet_cap, priorities):
     return [int(x) for x in res.x] if res.success else demands
 
 
-@app.route("/generate-plan", methods=["POST"])
+@app.route("/generate-plan", methods=["POST", "OPTIONS"])
 def generate_plan():
+    if request.method == "OPTIONS":
+        return jsonify({"status": "ok"}), 200
+
     try:
         data = request.get_json(force=True)
 
