@@ -1,5 +1,5 @@
 """
-Alloc8 v5.0: Multimodal Backend (Road, Air, Sea) - FIXED
+Alloc8 v5.0: Multimodal Backend (Road, Air, Sea) - FIXED CORS
 """
 
 import json
@@ -14,21 +14,18 @@ from scipy.optimize import linprog
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
+
+# --- CORS FIX STARTS HERE ---
+# We rely SOLELY on Flask-CORS.
+# We removed the manual 'after_request' and manual 'OPTIONS' handling.
 CORS(
     app,
-    resources={r"/*": {"origins": "https://alloc8-rho.vercel.app"}},
-    methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type"],
+    resources={
+        r"/*": {"origins": ["https://alloc8-rho.vercel.app", "http://localhost:3000"]}
+    },
     supports_credentials=True,
 )
-
-@app.after_request
-def add_cors_headers(response):
-    response.headers["Access-Control-Allow-Origin"] = "https://alloc8-rho.vercel.app"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-    return response
-
+# --- CORS FIX ENDS HERE ---
 
 CONSTANTS = {
     "osrm_base_url": "http://router.project-osrm.org",
@@ -178,13 +175,17 @@ def solve_allocation_lp(demands, fleet_cap, priorities):
     return [int(x) for x in res.x] if res.success else demands
 
 
-@app.route("/generate-plan", methods=["POST", "OPTIONS"])
+# FIX: Removed "OPTIONS" from methods. Flask-CORS handles that automatically.
+@app.route("/generate-plan", methods=["POST"])
 def generate_plan():
-    if request.method == "OPTIONS":
-        return jsonify({"status": "ok"}), 200
-
     try:
-        data = request.get_json(force=True)
+        # FIX: Removed force=True. Browser sends correct headers now.
+        data = request.get_json()
+
+        if not data:
+            return jsonify(
+                {"error": "Invalid JSON or Content-Type header missing"}
+            ), 400
 
         strategy = data.get("strategy", "welfare")
         parsed_needs = data.get("parsedNeeds", {})
@@ -257,7 +258,6 @@ def generate_plan():
             raw_demands, fleet_cap_total, priorities
         )
 
-        # FIX: Prepend depot demand (0)
         demands = [0] + allocated_amounts
 
         logging.info(f"Allocated amounts: {allocated_amounts}")
@@ -332,7 +332,6 @@ def generate_plan():
         )
         search_params.time_limit.seconds = int(data.get("time_limit_seconds", 15))
 
-        # FIX: Lower penalty to encourage visiting all nodes
         penalty = 100000
         for i in range(1, n):
             routing.AddDisjunction([manager.NodeToIndex(i)], penalty)
@@ -410,7 +409,6 @@ def generate_plan():
                 total_distance += route_dist
                 total_resources += route_load
 
-        # FIX: Add missing fields to summary
         return jsonify(
             {
                 "status": "success",
@@ -420,11 +418,11 @@ def generate_plan():
                 "summary": {
                     "title": f"{strategy.capitalize()} Multimodal Plan",
                     "description": f"Optimized using {len(routes)} vehicles (Road/Sea/Air).",
-                    "strategy": strategy.capitalize(),  # FIX: Add strategy
+                    "strategy": strategy.capitalize(),
                     "totalDistanceMeters": total_distance,
                     "totalResources": sum(raw_demands),
                     "assignedResources": total_resources,
-                    "totalTrucks": len(routes),  # FIX: Add totalTrucks
+                    "totalTrucks": len(routes),
                 },
             }
         )
