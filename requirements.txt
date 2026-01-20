@@ -1,6 +1,6 @@
-Flask
+flask
 flask-cors
+gunicorn
 requests
 ortools
 scipy
-gunicorn
